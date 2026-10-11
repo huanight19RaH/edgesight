@@ -1,0 +1,73 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Model weights & Checkpoints (Prevent large binary files from bloating GitHub)
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.engine
+*.bin
+*.weights
+*.ckpt
+weights/
+checkpoints/
+
+# Datasets & Large Media
+data/raw/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.tar
+*.tar.gz
+*.zip
+!data/samples/*.png
+
+# Raw traces (keep summaries, ignore huge trace dumps)
+raw/traces/*.jsonl
+
+# OS specific
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+# Core computer vision & inference
+opencv-python>=4.9.0
+numpy>=1.26.0
+Pillow>=10.2.0
+
+# Pretrained model support & edge optimization
+torch>=2.2.0
+torchvision>=0.17.0
+ultralytics>=8.1.0
+
+# Telemetry & benchmarking
+rich>=13.7.0
+pydantic>=2.6.0
+pytest>=8.0.0

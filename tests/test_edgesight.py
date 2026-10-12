@@ -107,10 +107,80 @@ class TestEdgeSight(unittest.TestCase):
             model_name="YOLOv8n",
             device="CPU",
             detection_count=1,
+            smoothed=True,
             notification="Testing Notification",
         )
         self.assertEqual(hud_frame.shape, (480, 640, 3))
 
+    def test_compute_iou(self):
+        """Verifies compute_iou accuracy for overlapping and disjoint boxes."""
+        from edgesight.smoother import compute_iou
+        box1 = [0.0, 0.0, 100.0, 100.0]
+        box2 = [0.0, 0.0, 100.0, 100.0]
+        self.assertAlmostEqual(compute_iou(box1, box2), 1.0)
+
+        box3 = [50.0, 0.0, 150.0, 100.0]  # Overlap 50x100 = 5000 / 15000 = 0.3333
+        self.assertAlmostEqual(compute_iou(box1, box3), 5000.0 / 15000.0, places=4)
+
+        box_disjoint = [200.0, 200.0, 300.0, 300.0]
+        self.assertEqual(compute_iou(box1, box_disjoint), 0.0)
+
+    def test_temporal_smoother(self):
+        """Verifies EMA anti-jitter smoothing on noisy box sequences."""
+        from edgesight.smoother import TemporalBoxSmoother
+        smoother = TemporalBoxSmoother(alpha=0.5, iou_threshold=0.3, max_age=2)
+
+        # Base box with artificial jitter (+- 10 pixels)
+        jitter_offsets = [0.0, 10.0, -10.0, 8.0, -8.0]
+        smoothed_x1s = []
+
+        for offset in jitter_offsets:
+            raw_res = {
+                "boxes": [[100.0 + offset, 100.0, 200.0 + offset, 200.0]],
+                "scores": [0.8],
+                "class_ids": [0],
+                "class_names": ["person"],
+                "count": 1,
+            }
+            smoothed = smoother.update(raw_res)
+            self.assertEqual(smoothed["count"], 1)
+            self.assertIn("track_ids", smoothed)
+            smoothed_x1s.append(smoothed["boxes"][0][0])
+
+        # Variance of smoothed x1 should be lower than raw jitter variance
+        raw_x1s = [100.0 + off for off in jitter_offsets]
+        self.assertLess(np.var(smoothed_x1s), np.var(raw_x1s))
+
+    def test_temporal_coasting_and_purge(self):
+        """Verifies coasting on momentary occlusion and purging after max_age."""
+        from edgesight.smoother import TemporalBoxSmoother
+        smoother = TemporalBoxSmoother(alpha=0.6, max_age=2)
+
+        # Frame 1: object present
+        res1 = {
+            "boxes": [[50.0, 50.0, 150.0, 150.0]],
+            "scores": [0.9],
+            "class_ids": [0],
+            "class_names": ["cup"],
+        }
+        out1 = smoother.update(res1)
+        self.assertEqual(out1["count"], 1)
+
+        # Frame 2: object temporarily dropped / occluded (empty raw detections)
+        out2 = smoother.update({"boxes": [], "scores": [], "class_ids": [], "class_names": []})
+        # Should coast (keep 1 tracked object alive with slightly reduced confidence)
+        self.assertEqual(out2["count"], 1)
+        self.assertLess(out2["scores"][0], 0.9)
+
+        # Frame 3: still empty (age = 2 == max_age)
+        out3 = smoother.update({"boxes": [], "scores": [], "class_ids": [], "class_names": []})
+        self.assertEqual(out3["count"], 1)
+
+        # Frame 4: still empty (age = 3 > max_age) -> track should now be purged
+        out4 = smoother.update({"boxes": [], "scores": [], "class_ids": [], "class_names": []})
+        self.assertEqual(out4["count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

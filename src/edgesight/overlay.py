@@ -28,21 +28,26 @@ def draw_detections(
     results: Dict[str, Any],
     box_thickness: int = 2,
 ) -> np.ndarray:
-    """Draws bounding boxes and confidence labels on frame."""
+    """Draws bounding boxes, tracking IDs, and confidence labels on frame."""
     boxes: List[List[float]] = results.get("boxes", [])
     scores: List[float] = results.get("scores", [])
     class_ids: List[int] = results.get("class_ids", [])
     class_names: List[str] = results.get("class_names", [])
+    track_ids: List[int] = results.get("track_ids", [])
 
     for i, (box, score, cls_id, cls_name) in enumerate(zip(boxes, scores, class_ids, class_names)):
-        x1, y1, x2, y2 = [int(v) for v in box]
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
         color = get_color(cls_id)
 
         # Draw bounding rectangle
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
 
-        # Label pill background
-        label_text = f"{cls_name} {score * 100:.0f}%"
+        # Build label text (with track ID if available)
+        if track_ids and i < len(track_ids):
+            label_text = f"#{track_ids[i]} {cls_name} {score * 100:.0f}%"
+        else:
+            label_text = f"{cls_name} {score * 100:.0f}%"
+
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.5
         font_thick = 1
@@ -78,12 +83,13 @@ def draw_telemetry_hud(
     model_name: str = "YOLOv8n",
     device: str = "CPU",
     detection_count: int = 0,
+    smoothed: bool = True,
     notification: Optional[str] = None,
 ) -> np.ndarray:
     """Renders semi-transparent HUD banner with FPS and per-stage latency."""
     h, w = frame.shape[:2]
     hud_h = 60
-    hud_w = min(w - 20, 600)
+    hud_w = min(w - 20, 620)
 
     # Semi-transparent overlay box
     overlay = frame.copy()
@@ -126,8 +132,9 @@ def draw_telemetry_hud(
         cv2.LINE_AA,
     )
 
-    # Telemetry line 2: Model, device, and object count
-    line2 = f"Model: {model_name} [{device.upper()}] | Detected: {detection_count} objs | Res: {w}x{h}"
+    # Telemetry line 2: Model, device, smoother status, and object count
+    smooth_str = "EMA ON" if smoothed else "OFF"
+    line2 = f"Model: {model_name} [{device.upper()}] | Smooth: {smooth_str} | Detected: {detection_count} objs | Res: {w}x{h}"
     cv2.putText(
         frame,
         line2,

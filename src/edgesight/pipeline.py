@@ -11,6 +11,7 @@ import numpy as np
 from edgesight.capture import VideoSource
 from edgesight.model import load_detector
 from edgesight.overlay import draw_detections, draw_telemetry_hud
+from edgesight.smoother import TemporalBoxSmoother
 from edgesight.telemetry import TelemetryRecorder
 
 
@@ -55,6 +56,29 @@ def main():
         type=int,
         default=480,
         help="Capture frame height",
+    )
+    parser.add_argument(
+        "--no-smooth",
+        action="store_true",
+        help="Disable temporal bounding box smoothing",
+    )
+    parser.add_argument(
+        "--smooth-alpha",
+        type=float,
+        default=0.65,
+        help="EMA smoothing alpha weight (0.1 to 0.95)",
+    )
+    parser.add_argument(
+        "--smooth-iou",
+        type=float,
+        default=0.35,
+        help="IoU tracking threshold for association",
+    )
+    parser.add_argument(
+        "--max-age",
+        type=int,
+        default=2,
+        help="Max frames to coast an occluded track",
     )
     parser.add_argument(
         "--benchmark",
@@ -118,6 +142,14 @@ def main():
 
     recorder = TelemetryRecorder(model_name=model_name, device=args.device)
 
+    # Temporal smoother
+    smoother = TemporalBoxSmoother(
+        iou_threshold=args.smooth_iou,
+        alpha=args.smooth_alpha,
+        max_age=args.max_age,
+    )
+    enable_smooth = not args.no_smooth
+
     # Optional video writer
     writer = None
     if args.output:
@@ -141,6 +173,8 @@ def main():
         print("  Controls:")
         print("    'q' / ESC : Quit pipeline")
         print("    's'       : Capture snapshot & save detection record")
+        print("    't'       : Toggle temporal smoothing (EMA)")
+        print("    'c'       : Clear tracking history")
         print("    'h'       : Toggle telemetry HUD")
         print("    'b'       : Toggle bounding boxes")
     else:
@@ -155,10 +189,16 @@ def main():
             results, telemetry = detector.predict(frame)
             recorder.record_frame(fps, telemetry)
 
+            # Apply temporal smoothing if enabled
+            if enable_smooth:
+                display_results = smoother.update(results)
+            else:
+                display_results = results
+
             # Annotation
             annotated = frame.copy()
-            if show_boxes and results["count"] > 0:
-                annotated = draw_detections(annotated, results)
+            if show_boxes and display_results["count"] > 0:
+                annotated = draw_detections(annotated, display_results)
 
             # Check expired notification
             if notification and time.time() > notification_until:
@@ -171,7 +211,8 @@ def main():
                     telemetry=telemetry,
                     model_name=model_name,
                     device=args.device,
-                    detection_count=results["count"],
+                    detection_count=display_results["count"],
+                    smoothed=enable_smooth,
                     notification=notification,
                 )
 
@@ -188,6 +229,16 @@ def main():
                     show_hud = not show_hud
                 elif key == ord("b"):
                     show_boxes = not show_boxes
+                elif key == ord("t"):
+                    enable_smooth = not enable_smooth
+                    if not enable_smooth:
+                        smoother.reset()
+                    notification = f"Temporal Smoothing: {'ON (EMA)' if enable_smooth else 'OFF'}"
+                    notification_until = time.time() + 2.0
+                elif key == ord("c"):
+                    smoother.reset()
+                    notification = "Tracking history cleared"
+                    notification_until = time.time() + 1.5
                 elif key == ord("s"):
                     # Save snapshot for failure mode / inspection analysis
                     ts = int(time.time())
@@ -200,7 +251,7 @@ def main():
                             "frame_idx": frame_idx,
                             "timestamp": ts,
                             "path": shot_path,
-                            "results": results,
+                            "results": display_results,
                             "telemetry": telemetry,
                         }
                         mf.write(json.dumps(entry) + "\n")

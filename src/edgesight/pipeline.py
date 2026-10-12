@@ -1,61 +1,228 @@
-"""CLI entrypoint and end-to-end pipeline runner."""
+"""CLI entrypoint and end-to-end edge vision pipeline runner."""
 
 import argparse
+import json
+import os
 import sys
+import time
 import cv2
+import numpy as np
+
 from edgesight.capture import VideoSource
-from edgesight.model import BaselineDetector
+from edgesight.model import load_detector
+from edgesight.overlay import draw_detections, draw_telemetry_hud
+from edgesight.telemetry import TelemetryRecorder
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EdgeSight on-device inference runner")
-    parser.add_argument("--source", default="0", help="Webcam index (e.g. 0) or video file path")
-    parser.add_argument("--benchmark", action="store_true", help="Run in benchmark mode without GUI window")
-    parser.add_argument("--max-frames", type=int, default=100, help="Max frames for benchmark mode")
+    parser = argparse.ArgumentParser(
+        description="EdgeSight on-device inference runner with live webcam and telemetry"
+    )
+    parser.add_argument(
+        "--source",
+        default="0",
+        help="Webcam index (e.g. 0), video file path, or 'synthetic'",
+    )
+    parser.add_argument(
+        "--model",
+        default="yolo",
+        help="Model type ('yolo' or 'baseline') or path to .pt weights",
+    )
+    parser.add_argument(
+        "--weights",
+        default="weights/yolov8n.pt",
+        help="Path to model weights file",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.35,
+        help="Confidence detection threshold (0.0 - 1.0)",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="Compute device ('cpu' recommended for edge profiling)",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=640,
+        help="Capture frame width",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=480,
+        help="Capture frame height",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Headless mode without GUI window (for automated profiling)",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=100,
+        help="Max frames to process in benchmark mode",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to export annotated video (.mp4)",
+    )
+    parser.add_argument(
+        "--save-telemetry",
+        default="raw/telemetry_latest.json",
+        help="Path to save summary telemetry JSON report",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        default="raw/snapshots",
+        help="Directory to save inspection snapshots",
+    )
     args = parser.parse_args()
 
-    cap = VideoSource(source=args.source)
-    detector = BaselineDetector()
+    # Determine detector model
+    weights_path = args.weights
+    if args.model.endswith(".pt"):
+        weights_path = args.model
+        model_type = "yolo"
+    else:
+        model_type = args.model
 
-    print(f"[EdgeSight] Initializing capture on source: {args.source}")
+    print(f"[EdgeSight] Initializing video source: {args.source} ({args.width}x{args.height})")
+    cap = VideoSource(source=args.source, width=args.width, height=args.height)
     if not cap.open():
-        print(f"[Error] Could not open video source: {args.source}", file=sys.stderr)
+        print(
+            f"[Error] Failed to open video source: '{args.source}'. "
+            "If using webcam, check if camera index is correct or try --source synthetic.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    print("[EdgeSight] Pipeline ready. Press 'q' to quit.")
-    frame_count = 0
-    latencies = []
+    print(f"[EdgeSight] Loading model '{model_type}' on device '{args.device}' (conf={args.conf})...")
+    try:
+        detector = load_detector(
+            model_type=model_type,
+            weights_path=weights_path,
+            conf_thresh=args.conf,
+            device=args.device,
+        )
+        model_name = getattr(detector, "model_name", "YOLOv8n")
+    except Exception as e:
+        print(f"[Warning] Failed to load {model_type} ({e}). Falling back to BaselineDetector.")
+        detector = load_detector(model_type="baseline", conf_thresh=args.conf)
+        model_name = getattr(detector, "model_name", "BaselineDetector")
+
+    recorder = TelemetryRecorder(model_name=model_name, device=args.device)
+
+    # Optional video writer
+    writer = None
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.output, fourcc, 30.0, (args.width, args.height))
+        print(f"[EdgeSight] Recording output video to: {args.output}")
+
+    # UI state
+    show_hud = True
+    show_boxes = True
+    notification = None
+    notification_until = 0.0
+    frame_idx = 0
+
+    os.makedirs(args.snapshot_dir, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("  EdgeSight Live Pipeline Running")
+    if not args.benchmark:
+        print("  Controls:")
+        print("    'q' / ESC : Quit pipeline")
+        print("    's'       : Capture snapshot & save detection record")
+        print("    'h'       : Toggle telemetry HUD")
+        print("    'b'       : Toggle bounding boxes")
+    else:
+        print(f"  Benchmark Mode: Processing {args.max_frames} frames headless...")
+    print("=" * 60 + "\n")
 
     try:
         for frame, fps in cap.frames():
-            frame_count += 1
+            frame_idx += 1
+
+            # Inference & telemetry
             results, telemetry = detector.predict(frame)
-            latencies.append(telemetry["total_ms"])
+            recorder.record_frame(fps, telemetry)
+
+            # Annotation
+            annotated = frame.copy()
+            if show_boxes and results["count"] > 0:
+                annotated = draw_detections(annotated, results)
+
+            # Check expired notification
+            if notification and time.time() > notification_until:
+                notification = None
+
+            if show_hud:
+                annotated = draw_telemetry_hud(
+                    frame=annotated,
+                    fps=fps,
+                    telemetry=telemetry,
+                    model_name=model_name,
+                    device=args.device,
+                    detection_count=results["count"],
+                    notification=notification,
+                )
+
+            if writer is not None:
+                writer.write(annotated)
 
             if not args.benchmark:
-                cv2.putText(
-                    frame,
-                    f"FPS: {fps:.1f} | Latency: {telemetry['total_ms']:.1f}ms",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2
-                )
-                cv2.imshow("EdgeSight Stream", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            else:
-                if frame_count >= args.max_frames:
-                    break
+                cv2.imshow("EdgeSight Stream", annotated)
+                key = cv2.waitKey(1) & 0xFF
 
-        if latencies:
-            avg_lat = sum(latencies) / len(latencies)
-            print(f"[Benchmark Summary] Processed {len(latencies)} frames | Avg latency: {avg_lat:.2f}ms")
+                if key in (ord("q"), 27):  # 'q' or ESC
+                    break
+                elif key == ord("h"):
+                    show_hud = not show_hud
+                elif key == ord("b"):
+                    show_boxes = not show_boxes
+                elif key == ord("s"):
+                    # Save snapshot for failure mode / inspection analysis
+                    ts = int(time.time())
+                    shot_path = os.path.join(args.snapshot_dir, f"frame_{frame_idx}_{ts}.jpg")
+                    cv2.imwrite(shot_path, annotated)
+
+                    meta_path = os.path.join(args.snapshot_dir, "snapshots.jsonl")
+                    with open(meta_path, "a", encoding="utf-8") as mf:
+                        entry = {
+                            "frame_idx": frame_idx,
+                            "timestamp": ts,
+                            "path": shot_path,
+                            "results": results,
+                            "telemetry": telemetry,
+                        }
+                        mf.write(json.dumps(entry) + "\n")
+
+                    notification = f"Snapshot saved: {os.path.basename(shot_path)}"
+                    notification_until = time.time() + 2.0
+            else:
+                if frame_idx >= args.max_frames:
+                    break
 
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if writer is not None:
+            writer.release()
+        if not args.benchmark:
+            cv2.destroyAllWindows()
+
+    # Telemetry report
+    recorder.print_summary()
+    if args.save_telemetry:
+        recorder.save_json(args.save_telemetry)
+        print(f"[EdgeSight] Summary telemetry saved to: {args.save_telemetry}")
 
 
 if __name__ == "__main__":

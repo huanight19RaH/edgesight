@@ -190,6 +190,24 @@ class BaselineDetector(BaseEdgeDetector):
         return results, telemetry
 
 
+def resolve_weights_path(weights_path: str) -> str:
+    """Finds weights path relative to CWD or edgesight project root."""
+    if os.path.exists(weights_path):
+        return weights_path
+    
+    # Try relative to edgesight project root (src/edgesight/../../weights/...)
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidate_1 = os.path.join(project_root, weights_path)
+    if os.path.exists(candidate_1):
+        return candidate_1
+        
+    candidate_2 = os.path.join(project_root, "weights", os.path.basename(weights_path))
+    if os.path.exists(candidate_2):
+        return candidate_2
+
+    return weights_path
+
+
 def load_detector(
     model_type: str = "yolo",
     weights_path: str = "weights/yolov8n.pt",
@@ -197,10 +215,12 @@ def load_detector(
     device: str = "cpu",
 ) -> BaseEdgeDetector:
     """Factory creating appropriate detector based on availability and request."""
-    if model_type.lower() == "yolo" and os.path.exists(weights_path):
+    resolved_path = resolve_weights_path(weights_path)
+    if model_type.lower() == "yolo" and os.path.exists(resolved_path):
         return YOLOEdgeDetector(
-            model_path=weights_path,
+            model_path=resolved_path,
             conf_thresh=conf_thresh,
             device=device,
         )
     return BaselineDetector(confidence_threshold=conf_thresh)
+

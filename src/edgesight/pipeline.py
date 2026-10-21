@@ -81,6 +81,17 @@ def main():
         help="Max frames to coast an occluded track",
     )
     parser.add_argument(
+        "--backend",
+        choices=["auto", "onnx", "pytorch"],
+        default="auto",
+        help="Inference runtime backend: 'onnx' (high-performance) or 'pytorch'",
+    )
+    parser.add_argument(
+        "--async-capture",
+        action="store_true",
+        help="Enable non-blocking asynchronous camera capture thread (zero stream lag)",
+    )
+    parser.add_argument(
         "--benchmark",
         action="store_true",
         help="Headless mode without GUI window (for automated profiling)",
@@ -108,16 +119,24 @@ def main():
     )
     args = parser.parse_args()
 
-    # Determine detector model
+    # Determine detector model & weights
     weights_path = args.weights
-    if args.model.endswith(".pt"):
+    if args.model.endswith(".pt") or args.model.endswith(".onnx"):
         weights_path = args.model
-        model_type = "yolo"
+        model_type = "onnx" if args.model.endswith(".onnx") else "yolo"
     else:
         model_type = args.model
 
-    print(f"[EdgeSight] Initializing video source: {args.source} ({args.width}x{args.height})")
-    cap = VideoSource(source=args.source, width=args.width, height=args.height)
+    print(
+        f"[EdgeSight] Initializing video source: {args.source} ({args.width}x{args.height})"
+        f"{' [Async Threaded]' if args.async_capture else ''}"
+    )
+    cap = VideoSource(
+        source=args.source,
+        width=args.width,
+        height=args.height,
+        threaded=args.async_capture,
+    )
     if not cap.open():
         print(
             f"[Error] Failed to open video source: '{args.source}'. "
@@ -126,13 +145,17 @@ def main():
         )
         sys.exit(1)
 
-    print(f"[EdgeSight] Loading model '{model_type}' on device '{args.device}' (conf={args.conf})...")
+    print(
+        f"[EdgeSight] Loading model '{model_type}' (backend={args.backend}) "
+        f"on device '{args.device}' (conf={args.conf})..."
+    )
     try:
         detector = load_detector(
             model_type=model_type,
             weights_path=weights_path,
             conf_thresh=args.conf,
             device=args.device,
+            backend=args.backend,
         )
         model_name = getattr(detector, "model_name", "YOLOv8n")
     except Exception as e:

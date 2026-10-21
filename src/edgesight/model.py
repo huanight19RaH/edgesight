@@ -18,7 +18,7 @@ class BaseEdgeDetector(ABC):
 
 
 class YOLOEdgeDetector(BaseEdgeDetector):
-    """Ultralytics YOLO detector optimized for real-time edge CPU inference."""
+    """Ultralytics YOLO PyTorch detector optimized for real-time edge CPU inference."""
 
     def __init__(
         self,
@@ -117,6 +117,116 @@ class YOLOEdgeDetector(BaseEdgeDetector):
             "orig_shape": orig_shape,
             "model": self.model_name,
             "device": self.device,
+            "backend": "pytorch",
+        }
+
+        telemetry = {
+            "preprocess_ms": float(prep_ms),
+            "inference_ms": float(inf_ms),
+            "postprocess_ms": float(post_ms),
+            "total_ms": float(total_ms),
+        }
+
+        return results, telemetry
+
+
+class ONNXEdgeDetector(BaseEdgeDetector):
+    """ONNX Runtime accelerated detector for high-throughput, low-latency edge inference."""
+
+    def __init__(
+        self,
+        model_path: str = "weights/yolov8n.onnx",
+        conf_thresh: float = 0.35,
+        device: str = "cpu",
+        warmup: bool = True,
+    ):
+        self.model_path = model_path
+        self.conf_thresh = conf_thresh
+        self.device = device
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"ONNX model weights not found at: {model_path}. "
+                "Ensure weights exist at weights/yolov8n.onnx"
+            )
+
+        from ultralytics import YOLO
+
+        self.model = YOLO(model_path, task="detect")
+        self.model_name = os.path.basename(model_path)
+
+        # Pre-warm ONNX session to avoid first-frame compilation jitter
+        if warmup:
+            self._warmup()
+
+    def _warmup(self):
+        """Runs a 1-frame dummy pass to warm ONNX Runtime session and memory buffers."""
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        _ = self.model.predict(
+            dummy_frame,
+            conf=self.conf_thresh,
+            device=self.device,
+            verbose=False,
+            imgsz=640,
+        )
+
+    def predict(self, frame: np.ndarray) -> Tuple[Dict[str, Any], Dict[str, float]]:
+        """Runs ONNX Runtime inference and records per-stage telemetry in milliseconds."""
+        t0 = time.perf_counter()
+
+        t_prep_start = time.perf_counter()
+        orig_shape = frame.shape
+        t_prep_end = time.perf_counter()
+
+        t_inf_start = time.perf_counter()
+        outputs = self.model.predict(
+            frame,
+            conf=self.conf_thresh,
+            device=self.device,
+            verbose=False,
+            imgsz=640,
+        )
+        t_inf_end = time.perf_counter()
+
+        t_post_start = time.perf_counter()
+        boxes: List[List[float]] = []
+        scores: List[float] = []
+        class_ids: List[int] = []
+        class_names: List[str] = []
+
+        if outputs and len(outputs) > 0:
+            res = outputs[0]
+            if res.boxes is not None and len(res.boxes) > 0:
+                xyxy = res.boxes.xyxy.cpu().numpy()
+                confs = res.boxes.conf.cpu().numpy()
+                cls_indices = res.boxes.cls.cpu().numpy().astype(int)
+                names_dict = res.names
+
+                for box, conf, cls_idx in zip(xyxy, confs, cls_indices):
+                    boxes.append([float(c) for c in box])
+                    scores.append(float(conf))
+                    class_ids.append(int(cls_idx))
+                    class_names.append(str(names_dict.get(cls_idx, f"cls_{cls_idx}")))
+
+        t_post_end = time.perf_counter()
+        t_total = time.perf_counter()
+
+        internal_speed = outputs[0].speed if outputs else {}
+        prep_ms = internal_speed.get("preprocess", (t_prep_end - t_prep_start) * 1000.0)
+        inf_ms = internal_speed.get("inference", (t_inf_end - t_inf_start) * 1000.0)
+        post_ms = internal_speed.get("postprocess", (t_post_end - t_post_start) * 1000.0)
+        total_ms = (t_total - t0) * 1000.0
+
+        results = {
+            "boxes": boxes,
+            "scores": scores,
+            "class_ids": class_ids,
+            "class_names": class_names,
+            "count": len(boxes),
+            "orig_shape": orig_shape,
+            "model": self.model_name,
+            "device": self.device,
+            "backend": "onnx",
         }
 
         telemetry = {
@@ -178,6 +288,7 @@ class BaselineDetector(BaseEdgeDetector):
             "orig_shape": frame.shape,
             "model": self.model_name,
             "device": "cpu",
+            "backend": "baseline",
         }
 
         telemetry = {
@@ -194,13 +305,13 @@ def resolve_weights_path(weights_path: str) -> str:
     """Finds weights path relative to CWD or edgesight project root."""
     if os.path.exists(weights_path):
         return weights_path
-    
+
     # Try relative to edgesight project root (src/edgesight/../../weights/...)
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     candidate_1 = os.path.join(project_root, weights_path)
     if os.path.exists(candidate_1):
         return candidate_1
-        
+
     candidate_2 = os.path.join(project_root, "weights", os.path.basename(weights_path))
     if os.path.exists(candidate_2):
         return candidate_2
@@ -209,18 +320,62 @@ def resolve_weights_path(weights_path: str) -> str:
 
 
 def load_detector(
-    model_type: str = "yolo",
-    weights_path: str = "weights/yolov8n.pt",
+    model_type: str = "auto",
+    weights_path: Optional[str] = None,
     conf_thresh: float = 0.35,
     device: str = "cpu",
+    backend: str = "auto",
 ) -> BaseEdgeDetector:
-    """Factory creating appropriate detector based on availability and request."""
-    resolved_path = resolve_weights_path(weights_path)
-    if model_type.lower() == "yolo" and os.path.exists(resolved_path):
-        return YOLOEdgeDetector(
-            model_path=resolved_path,
+    """Factory creating appropriate detector based on availability and request.
+
+    Args:
+        model_type: 'auto', 'yolo', 'onnx', or 'baseline'
+        weights_path: Optional path to weights file
+        conf_thresh: Confidence threshold for predictions
+        device: 'cpu' or device identifier
+        backend: 'auto', 'onnx', or 'pytorch'
+    """
+    if model_type.lower() == "baseline":
+        return BaselineDetector(confidence_threshold=conf_thresh)
+
+    # Determine resolved weights path
+    if weights_path is not None:
+        resolved = resolve_weights_path(weights_path)
+        if (backend == "onnx" or model_type.lower() == "onnx") and resolved.endswith(".pt"):
+            onnx_equivalent = resolved[:-3] + ".onnx"
+            if os.path.exists(onnx_equivalent):
+                resolved = onnx_equivalent
+    else:
+        # Check auto discovery: prefer onnx for speed, fallback to pt
+        onnx_cand = resolve_weights_path("weights/yolov8n.onnx")
+        pt_cand = resolve_weights_path("weights/yolov8n.pt")
+        if backend in ("auto", "onnx") and os.path.exists(onnx_cand):
+            resolved = onnx_cand
+        elif os.path.exists(pt_cand):
+            resolved = pt_cand
+        else:
+            resolved = "weights/yolov8n.onnx"
+
+    # If ONNX requested or resolved is an onnx file
+    if (backend == "onnx" or resolved.endswith(".onnx") or model_type.lower() == "onnx") and os.path.exists(resolved):
+        return ONNXEdgeDetector(
+            model_path=resolved,
             conf_thresh=conf_thresh,
             device=device,
         )
-    return BaselineDetector(confidence_threshold=conf_thresh)
 
+    # If PyTorch YOLO requested or resolved is a pt file
+    if (backend in ("auto", "pytorch") or model_type.lower() == "yolo") and os.path.exists(resolved):
+        if resolved.endswith(".onnx"):
+            return ONNXEdgeDetector(
+                model_path=resolved,
+                conf_thresh=conf_thresh,
+                device=device,
+            )
+        return YOLOEdgeDetector(
+            model_path=resolved,
+            conf_thresh=conf_thresh,
+            device=device,
+        )
+
+    return BaselineDetector(confidence_threshold=conf_thresh)

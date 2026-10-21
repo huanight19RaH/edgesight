@@ -180,6 +180,49 @@ class TestEdgeSight(unittest.TestCase):
         out4 = smoother.update({"boxes": [], "scores": [], "class_ids": [], "class_names": []})
         self.assertEqual(out4["count"], 0)
 
+    def test_threaded_video_source(self):
+        """Verifies asynchronous background threaded capture."""
+        from edgesight.capture import ThreadedVideoSource
+        with ThreadedVideoSource(source="synthetic", width=320, height=240, synthetic_fps=60.0) as cap:
+            props = cap.get_properties()
+            self.assertTrue(props["threaded"])
+            self.assertEqual(props["source"], "synthetic")
+
+            # Test atomic latest read
+            frame, fps = cap.read_latest()
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame.shape, (240, 320, 3))
+
+            # Test frames generator in threaded mode
+            count = 0
+            for frame, fps in cap.frames():
+                self.assertEqual(frame.shape, (240, 320, 3))
+                count += 1
+                if count >= 3:
+                    break
+            self.assertEqual(count, 3)
+
+    def test_onnx_edge_detector(self):
+        """Verifies ONNXEdgeDetector initialization and inference on CPU."""
+        from edgesight.model import ONNXEdgeDetector
+        onnx_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "weights", "yolov8n.onnx")
+        )
+        if not os.path.exists(onnx_path):
+            self.skipTest("yolov8n.onnx not present, skipping ONNX test")
+
+        detector = ONNXEdgeDetector(model_path=onnx_path, device="cpu", warmup=False)
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        results, telemetry = detector.predict(dummy_frame)
+        self.assertEqual(results["device"], "cpu")
+        self.assertEqual(results["backend"], "onnx")
+        self.assertIn("boxes", results)
+        self.assertIn("total_ms", telemetry)
+        self.assertIn("inference_ms", telemetry)
+        self.assertIn("preprocess_ms", telemetry)
+        self.assertIn("postprocess_ms", telemetry)
+
 
 if __name__ == "__main__":
     unittest.main()
